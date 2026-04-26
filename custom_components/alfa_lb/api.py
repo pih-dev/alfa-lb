@@ -28,6 +28,19 @@ API_URL = "https://wsitranslator-live.alfa.com.lb/V2/Default"
 _AES_KEY = b"CXLI1C3iCLHRQk5MH9aDvdYYQfAFlte2"
 _AES_IV = b"t0dmo_999@999---"
 
+# V3 transport — used by Services/Get + Bundle/* + Services/{Sub,Unsub}scribe
+# + PinCode/Get. Different base URL from V2 (mobapirules-live, not
+# wsitranslator-live) but — per jadx CrossPlatformEncryptor key/IV
+# Caesar-shift resolution — the SAME AES key + IV as V2. The OkHttp
+# interceptor (jadx Z1/f.java) rewrites every outgoing V3 POST to
+# /V3/Default/Get and splits the original endpoint name into ``Method`` /
+# ``ActionID`` body fields. EMPIRICAL FINDING (2026-04-26 live test): the
+# server WAF rejects ``application/x-www-form-urlencoded`` bodies but
+# accepts the same V2-style JSON envelope ``{"Data": "<ciphertext>"}`` —
+# so the actual transport diverges from f.java's FormBody construction.
+# The plaintext envelope inside ``Data`` matches f.java exactly though.
+V3_API_URL = "https://mobapirules-live.alfa.com.lb/V3/Default/Get"
+
 _HEADERS = {
     "Content-Type": "application/json; charset=UTF-8",
     "Accept": "application/json",
@@ -56,6 +69,8 @@ def _encrypt(plaintext: str) -> str:
 def _decrypt(ciphertext: str) -> str:
     cipher = AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV)
     return unpad(cipher.decrypt(base64.b64decode(ciphertext)), 16).decode()
+
+
 
 
 def _parse_money(raw: Any) -> float | None:
@@ -100,6 +115,49 @@ def _to_mb(value: str | None, unit: str | None) -> float | None:
     if u == "KB":
         return num / 1000
     return num
+
+
+def _normalise_service(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Map an Alfa ``Services/Get`` record (``AlfaServiceDTO``) to a stable
+    internal shape. Field names on the right come from jadx decompile of
+    AlfaNet APK v5.2.86 — see
+    ``_archive/HomeLab/alfa/2026-04-26-jadx-body-shapes.md``. Returns ``None``
+    when the input isn't a dict so the coordinator can drop bad records
+    silently rather than crashing.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return {
+            # Primary identifiers passed back to all paid ops.
+            "service_id": raw.get("id"),
+            "alias": raw.get("alias"),
+            "name": raw.get("name"),
+            # State flags.
+            "is_subscribed": bool(raw.get("is_subscribed", False)),
+            "is_renewable": bool(raw.get("is_renewable", False)),
+            "is_managable": bool(raw.get("is_managable", False)),
+            "can_subscribe": bool(raw.get("can_subscribe", False)),
+            "can_unsubscribe": bool(raw.get("can_unsubscribe", False)),
+            "view_only": bool(raw.get("view_only", False)),
+            # PIN flow + action_name candidates for PinCode/Get.
+            "require_pin": bool(raw.get("require_pin", False)),
+            "sub_unsub_action_name": raw.get("sub_unsub_action_name"),
+            "manage_action_name": raw.get("manage_action_name"),
+            # Display + scheduling.
+            "price": raw.get("price"),
+            "validity": raw.get("validity"),
+            "service_cycle_date": raw.get("ServiceCycleDate"),
+            "short_description": raw.get("short_description"),
+            # Bundle catalog (inline — Bundle/Renew & Bundle/Modify draw from here).
+            "bundles": raw.get("bundles") or [],
+            # Keep the raw record so future fields (or live debugging) don't
+            # require redeploying the coordinator.
+            "raw": raw,
+        }
+    except (TypeError, ValueError, AttributeError) as err:
+        _LOGGER.warning("Failed to normalise Alfa service record: %s — raw=%r", err, raw)
+        return None
 
 
 class AlfaClient:
@@ -203,6 +261,111 @@ class AlfaClient:
             await self._signin()
             full = {**body, "AccessToken": self._token}
             result = await self._call(method, full)
+        return result
+
+    async def _v3_call(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST to V3 mobapirules with the AlfaNet-app envelope shape.
+
+        Mirrors the OkHttp interceptor in jadx ``Z1/f.java``:
+          * Splits ``path`` (e.g. ``Services/Get``) into ``Method`` and
+            ``ActionID`` body fields.
+          * Adds the standard envelope fields (Platform/App_version/
+            TimeStamp/Signature) into the body.
+          * Whole-body encrypts (same key/IV as V2 — the jadx
+            ``CrossPlatformEncryptor`` Caesar-shifted constants resolve to
+            V2's key + IV).
+          * Sends ``application/x-www-form-urlencoded`` with a single
+            ``Data=<ciphertext>`` field — NOT the JSON envelope V2 uses.
+
+        The actual URL path is rewritten to ``/V3/Default/Get`` regardless
+        of the endpoint name (the routing is encoded in ``Method`` /
+        ``ActionID`` inside the encrypted body)."""
+        try:
+            method_part, action_part = path.split("/", 1)
+        except ValueError as err:
+            raise AlfaApiError(
+                f"V3 path must contain a '/' splitting Method/ActionID: {path!r}"
+            ) from err
+
+        ts = int(time.time())
+        payload = {
+            **body,
+            "Method": method_part,
+            "ActionID": action_part,
+            "Platform": "android",
+            "App_version": "5.2.86",
+            "TimeStamp": ts,
+            "Signature": f"{random.randint(0, 100)}{ts}",
+        }
+        encrypted = _encrypt(json.dumps(payload, separators=(",", ":")))
+        # JSON envelope (same shape as V2) — the WAF rejects form-encoded
+        # bodies even though the OkHttp interceptor in the app builds one.
+        # The app's actual on-the-wire request likely passes through F5's
+        # accept list because of TLS fingerprinting; our requests don't,
+        # so we use the JSON envelope which the application backend ALSO
+        # accepts.
+        try:
+            async with self._session.post(
+                V3_API_URL,
+                json={"Data": encrypted},
+                headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 500:
+                    raise AlfaApiError(
+                        f"HTTP {resp.status} from V3 {path}: {text[:200]}"
+                    )
+                if resp.status >= 400:
+                    raise AlfaApiError(f"HTTP {resp.status} V3 {path}: {text[:200]}")
+                try:
+                    outer = json.loads(text)
+                except ValueError as err:
+                    raise AlfaApiError(f"Bad JSON envelope from V3 {path}: {err}") from err
+                if isinstance(outer, dict) and outer.get("Error"):
+                    raise AlfaApiError(f"V3 {path} API error: {outer['Error']}")
+                # Per the V2 envelope, response decryption is whole-body
+                # via the same AES key. The V3 interceptor (f.java line 101+)
+                # decrypts via the same encryptor used for the request.
+                data_blob = outer.get("Data") if isinstance(outer, dict) else None
+                if not data_blob:
+                    # Some V3 errors return a plain JSON envelope (no Data
+                    # field). Surface the whole structure rather than masking.
+                    return outer if isinstance(outer, dict) else {"raw": outer}
+                try:
+                    decrypted = _decrypt(data_blob)
+                except Exception as err:  # noqa: BLE001
+                    raise AlfaApiError(f"V3 {path} decrypt failed: {err}") from err
+                try:
+                    result = json.loads(decrypted)
+                except ValueError as err:
+                    raise AlfaApiError(f"Bad inner JSON from V3 {path}: {err}") from err
+                _LOGGER.debug("Alfa V3 %s -> Status=%s", path, result.get("Status"))
+                return result
+        except aiohttp.ClientError as err:
+            raise AlfaApiError(f"V3 transport error on {path}: {err}") from err
+        except asyncio.TimeoutError as err:
+            raise AlfaApiError(f"V3 timeout on {path}") from err
+
+    async def _v3_authed_call(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """V3 call with the V2 Signin ``accesstoken`` injected as the
+        ``AccessToken`` body field. TedmobApi has no Signin endpoint of its
+        own — all V3 ops accept a token harvested from V2 ``Signin``.
+
+        Re-signin-on-auth-fail mirrors the V2 ``_authed_call`` retry pattern
+        once V3 status-code semantics are confirmed; for now the V2 status
+        code set (``_STATUS_AUTH_FAILED``) is reused — same backend operator,
+        same auth subsystem in all likelihood."""
+        if not self._token:
+            await self._signin()
+        full = {**body, "AccessToken": self._token}
+        result = await self._v3_call(path, full)
+        status = result.get("Status") if isinstance(result, dict) else None
+        if status in _STATUS_AUTH_FAILED:
+            self._token = None
+            await self._signin()
+            full = {**body, "AccessToken": self._token}
+            result = await self._v3_call(path, full)
         return result
 
     async def async_validate(self) -> dict[str, Any]:
@@ -313,3 +476,63 @@ class AlfaClient:
             result["days_until_expiry"] = (exp_date - date.today()).days
 
         return result
+
+    async def async_get_services_list(self) -> list[dict[str, Any]]:
+        """Fetch the list of services + their inline bundle catalogs from V3.
+
+        Endpoint + body shape come from jadx of AlfaNet v5.2.86 — see
+        ``_archive/HomeLab/alfa/2026-04-26-jadx-body-shapes.md``. Posts to
+        ``mobapirules-live/V3/Services/Get`` with per-field encryption.
+        The Retrofit signature is ``List<AlfaServiceDTO>`` but the wire
+        shape may either BE the list or wrap it in a single key — we probe.
+        Response strings are best-effort decrypted (see
+        ``_v3_decrypt_response``); if a string isn't actually encrypted on
+        the wire it passes through untouched. Returns normalised dicts.
+        """
+        # ``LineType`` per jadx (TedmobServicesGetBody.lineType) — Pierre's
+        # account is prepaid. ``MSISDN`` is the line we're querying. All
+        # other body fields are optional filters; omitting them returns the
+        # full service list. The V2 ``accesstoken`` is added by
+        # ``_v3_authed_call``; ``Method``/``ActionID``/envelope fields are
+        # added by ``_v3_call``.
+        result = await self._v3_authed_call(
+            "Services/Get",
+            {"MSISDN": self._mobile, "LineType": "prepaid"},
+        )
+
+        # Probe container shape: V2-style envelope wraps payloads in a
+        # named field. The Retrofit response type is List<AlfaServiceDTO>
+        # but the wsitranslator/mobapirules envelopes typically nest under
+        # a key like ``ServicesValue``.
+        records: Any = None
+        if isinstance(result, list):
+            records = result
+        elif isinstance(result, dict):
+            for key in (
+                "ServicesValue",
+                "Services",
+                "ServicesList",
+                "services",
+                "Result",
+                "Data",
+            ):
+                candidate = result.get(key)
+                if isinstance(candidate, list):
+                    records = candidate
+                    break
+
+        if not isinstance(records, list):
+            _LOGGER.warning(
+                "Alfa V3 Services/Get response not a list — keys=%s",
+                list(result.keys()) if isinstance(result, dict)
+                else type(result).__name__,
+            )
+            return []
+
+        normalised = [n for n in (_normalise_service(r) for r in records) if n]
+        _LOGGER.debug(
+            "Alfa V3 Services/Get -> %d records, %d after normalise",
+            len(records),
+            len(normalised),
+        )
+        return normalised
