@@ -57,15 +57,9 @@ sees the update.
 
 ## Active divergences
 
-*(none yet — fork is currently at upstream `v0.3.1`, no Pierre-specific code)*
-
 | Branch | Status | Upstream-PR-candidate? | Summary |
 |---|---|---|---|
-| — | — | — | — |
-
-When a divergence is added, the row should look like:
-
-| `pierre/renew-bundles` | in-dev | yes | Adds `select` + `button` for in-app bundle renewal. Discovers `GetAvailableBundles` + `PurchaseBundle` from AlfaNet app v5.2.86. Includes 2-step arm/fire confirmation gate. |
+| `pierre/renew-bundles` | in-dev | yes | Adds `binary_sensor.alfa_<msisdn>_autorenew` (PROBLEM device_class) + 5 services (`disable_autorenew`, `enable_autorenew`, `renew_bundle`, `modify_bundle`, `refresh_bundles_list`) wrapping new AlfaNet API endpoints (`Services` list, `Services/Subscribe`, `Services/Unsubscribe`, `Bundle/Renew`, `Bundle/Modify`, `Bundles/List`). Paid ops gated by 5-min arm/fire helper + balance precheck + audit log + PIN flow. Read-only sensor + non-paid services are PR-ready; paid-op gating is Pierre-fork-specific (uses Pierre's HA helpers/lovelace) but service-handler code is upstream-clean. |
 
 ---
 
