@@ -68,3 +68,36 @@ def test_parse_consumption_empty_payload():
     assert data["bundles"] == []
     assert data["data_remaining_mb"] is None
     assert data["balance_usd"] is None
+
+
+def test_parse_consumption_excludes_non_data_and_partial_from_aggregate():
+    # Synthetic payload: one valid data bundle, one non-data (voice) bundle,
+    # and one data bundle with missing amounts. Only the first must count
+    # toward the data aggregate; all three must still appear in bundles[].
+    payload = {
+        "MobileNumberValue": "81265133",
+        "TypeValue": "Prepaid",
+        "CurrentBalanceValue": "$ 5.00",
+        "FreeUnitsValue": [
+            {"DisplayName": "Data 100GB", "UsageType": "data",
+             "TotalAmount": "100.00", "TotalUnit": "GB",
+             "UsedAmount": "40.00", "UsedUnit": "GB",
+             "ValidityDate": "20260801000000", "ExpiryTime": "20260831235959",
+             "LinkedOfferName": "Prepaid Data 100GB"},
+            {"DisplayName": "Voice 500min", "UsageType": "voice",
+             "TotalAmount": "500.00", "TotalUnit": "MIN",
+             "UsedAmount": "120.00", "UsedUnit": "MIN"},
+            {"DisplayName": "Data pending", "UsageType": "data",
+             "TotalAmount": "", "TotalUnit": "GB",
+             "UsedAmount": "", "UsedUnit": "GB"},
+        ],
+    }
+    data = parsers.parse_consumption(payload)
+    assert len(data["bundles"]) == 3
+    names = [b["name"] for b in data["bundles"]]
+    assert "Voice 500min" in names
+    assert "Data pending" in names
+    # aggregates count ONLY the single valid data bundle (100 GB total, 40 used)
+    assert data["data_total_mb"] == 100000
+    assert data["data_used_mb"] == 40000
+    assert data["data_remaining_mb"] == 60000
