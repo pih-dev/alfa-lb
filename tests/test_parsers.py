@@ -101,3 +101,29 @@ def test_parse_consumption_excludes_non_data_and_partial_from_aggregate():
     assert data["data_total_mb"] == 100000
     assert data["data_used_mb"] == 40000
     assert data["data_remaining_mb"] == 60000
+
+
+def test_parse_services_active_and_catalog():
+    svc = parsers.parse_services(load_json("getmyservicesasync.json"))
+    assert svc["active_bundle"]["value"] == "ALFANET400GB"
+    assert svc["active_bundle"]["gb"] == 400
+    assert svc["active_bundle"]["price_usd"] == 59.0
+    assert svc["active_bundle"]["is_addon"] is False
+    assert svc["simultaneous_activation"] is True
+
+    assert len(svc["catalog"]) == 20
+    mains = [b for b in svc["catalog"] if not b["is_addon"]]
+    addons = [b for b in svc["catalog"] if b["is_addon"]]
+    assert len(mains) == 10
+    assert len(addons) == 10
+    # 600GB main bundle present at $69
+    b600 = next(b for b in mains if b["gb"] == 600)
+    assert b600["price_usd"] == 69.0
+    assert b600["value"] == "ALFANET600GB"
+
+
+def test_parse_services_empty():
+    svc = parsers.parse_services([])
+    assert svc["active_bundle"] is None
+    assert svc["catalog"] == []
+    assert svc["simultaneous_activation"] is False

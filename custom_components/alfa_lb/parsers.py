@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 
 _MONEY_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_GB_RE = re.compile(r"(\d+)\s*GB", re.IGNORECASE)
 
 
 def parse_money(raw: Any) -> float | None:
@@ -113,4 +114,52 @@ def parse_consumption(payload: dict[str, Any]) -> dict[str, Any]:
         "data_total_mb": total_mb if saw_data else None,
         "data_used_mb": used_mb if saw_data else None,
         "data_remaining_mb": (total_mb - used_mb) if saw_data else None,
+    }
+
+
+def _parse_gb(text: str | None) -> int | None:
+    """`"400GB"` -> ``400``."""
+    if not text:
+        return None
+    m = _GB_RE.search(str(text))
+    return int(m.group(1)) if m else None
+
+
+def _bundle_obj(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": raw.get("Id"),
+        "value": raw.get("Value"),
+        "text": raw.get("Text") or raw.get("TextEn"),
+        "gb": _parse_gb(raw.get("Text") or raw.get("TextEn")),
+        "price_usd": parse_money(raw.get("Price") or raw.get("PriceEn")),
+        "is_addon": bool(raw.get("IsAddOn", False)),
+        "addon_desc": raw.get("AddOn") or raw.get("AddOnEn"),
+    }
+
+
+def parse_services(payload: Any) -> dict[str, Any]:
+    """Parse ``manage-services/getmyservicesasync``.
+
+    The response is a list of service objects; we take the AlfaNet service
+    (the only one for Pierre's data line) and expose its ActiveBundle +
+    inline Bundles[] catalog. Used for the 'active bundle' display now and
+    the deferred write UI later.
+    """
+    if not isinstance(payload, list) or not payload:
+        return {"active_bundle": None, "catalog": [], "simultaneous_activation": False}
+
+    # Prefer the AlfaNet service; fall back to the first service.
+    service = next(
+        (s for s in payload if isinstance(s, dict) and s.get("Alias") == "ALFANET"),
+        payload[0] if isinstance(payload[0], dict) else {},
+    )
+
+    active_raw = service.get("ActiveBundle")
+    active = _bundle_obj(active_raw) if isinstance(active_raw, dict) else None
+    catalog = [_bundle_obj(b) for b in service.get("Bundles") or [] if isinstance(b, dict)]
+
+    return {
+        "active_bundle": active,
+        "catalog": catalog,
+        "simultaneous_activation": bool(service.get("IsSimultaneousActivation", False)),
     }
