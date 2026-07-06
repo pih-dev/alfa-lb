@@ -1,315 +1,313 @@
-"""Alfa Lebanon mobile-API client.
+"""Alfa Lebanon web-portal client.
 
-Reverse-engineered from the official Android app (com.apps2you.alfa v5.2.86):
-all calls POST to ``/V2/Default`` with an AES-256-CBC encrypted JSON body
-wrapped as ``{"Data": "<base64 ciphertext>"}``. The plaintext carries the
-operation name in a ``Method`` field plus a few platform metadata fields.
-The user logs in with phone number + password — no captcha, no cookies.
+The AlfaNet web portal (www.alfa.com.lb/en/account) is a plain ASP.NET MVC
+site: cookie-session auth + an anti-forgery token (``__RequestVerificationToken``)
+scraped from the login page. No AES envelope, no cert pinning — a full rewrite
+of the dead mobile V2/V3 transport. See
+``_archive/HomeLab/alfa/2026-07-06-alfa-web-portal-api-map.md``.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import logging
-import random
+import re
 import time
 from datetime import date, datetime
 from typing import Any
 
 import aiohttp
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
+
+from . import parsers
+from .const import (
+    CONSUMPTION_PATH,
+    EXCHANGE_RATE_PATH,
+    EXPIRY_PATH,
+    LAST_RECHARGE_PATH,
+    LOGIN_PATH,
+    PORTAL_BASE,
+    SERVICES_PATH,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-API_URL = "https://wsitranslator-live.alfa.com.lb/V2/Default"
+_TOKEN_RE = re.compile(
+    r'name="__RequestVerificationToken"[^>]*value="([^"]+)"'
+)
+# The login page usually renders the input as name-before-value, but ASP.NET
+# can emit value-before-name. Try both orders.
+_TOKEN_RE_ALT = re.compile(
+    r'value="([^"]+)"[^>]*name="__RequestVerificationToken"'
+)
 
-_AES_KEY = b"CXLI1C3iCLHRQk5MH9aDvdYYQfAFlte2"
-_AES_IV = b"t0dmo_999@999---"
+# Markers that indicate we got an HTML page (login/OTP) instead of JSON,
+# i.e. the session is not authenticated.
+_OTP_MARKERS = ("otp", "verification code", "one-time")
 
 _HEADERS = {
-    "Content-Type": "application/json; charset=UTF-8",
-    "Accept": "application/json",
-    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 16; Pixel 7a Build/CP1A.260305.018)",
-    "Language": "en",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html, */*",
 }
-
-# Status codes returned in the decrypted payload (from the app's StatusCodes).
-_STATUS_OK = {2000, 8081, 8090, 8101}
-_STATUS_AUTH_FAILED = {3000, 3001, 3002, 4000, 4001, 4002}
 
 
 class AlfaAuthError(Exception):
-    """Credentials rejected by the Alfa API."""
+    """Credentials rejected / session cannot be established."""
+
+
+class AlfaOtpRequired(AlfaAuthError):
+    """Login hit an OTP challenge that cannot be answered headlessly."""
 
 
 class AlfaApiError(Exception):
     """Transport / parsing / non-auth API error."""
 
 
-def _encrypt(plaintext: str) -> str:
-    cipher = AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV)
-    return base64.b64encode(cipher.encrypt(pad(plaintext.encode(), 16))).decode()
+def _scrape_token(html: str) -> str | None:
+    """Extract ``__RequestVerificationToken`` from the login HTML."""
+    for rx in (_TOKEN_RE, _TOKEN_RE_ALT):
+        m = rx.search(html or "")
+        if m:
+            return m.group(1)
+    return None
 
 
-def _decrypt(ciphertext: str) -> str:
-    cipher = AES.new(_AES_KEY, AES.MODE_CBC, _AES_IV)
-    return unpad(cipher.decrypt(base64.b64decode(ciphertext)), 16).decode()
+class AlfaPortalClient:
+    """Async client for the Alfa web portal.
 
-
-def _parse_money(raw: Any) -> float | None:
-    """`"$ 63.05"` → ``63.05``. Bare numbers pass through."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    import re
-    m = re.search(r"-?\d+(?:\.\d+)?", str(raw))
-    return float(m.group(0)) if m else None
-
-
-def _parse_dmy(raw: str | None) -> date | None:
-    """`"19/05/2026"` → ``date(2026, 5, 19)``."""
-    if not raw:
-        return None
-    parts = raw.strip().split("/")
-    if len(parts) != 3:
-        return None
-    try:
-        d, m, y = (int(x) for x in parts)
-        return date(y, m, d)
-    except ValueError:
-        return None
-
-
-def _to_mb(value: str | None, unit: str | None) -> float | None:
-    """Normalise to decimal MB so HA's MEGABYTES/GIGABYTES conversion (/1000)
-    yields the same GB number the Alfa app shows. The operator labels plans in
-    decimal GB even though their internal accounting uses 1024-MB; matching the
-    user-visible label is the right UX call."""
-    if value is None:
-        return None
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return None
-    u = (unit or "").upper()
-    if u == "GB":
-        return num * 1000
-    if u == "KB":
-        return num / 1000
-    return num
-
-
-class AlfaClient:
-    """Async client for the Alfa mobile API.
-
-    Holds the credentials and a (cached) ``accesstoken``. Re-authenticates
-    transparently on token expiry; raises :class:`AlfaAuthError` only when
-    the password itself is wrong.
+    Holds a dedicated aiohttp session (its own cookie jar). Logs in once and
+    reuses the session cookie across polls; re-logs in only when a read shows
+    the session expired.
     """
 
     def __init__(
-        self,
-        session: aiohttp.ClientSession,
-        mobile: str,
-        password: str,
+        self, session: aiohttp.ClientSession, mobile: str, password: str
     ) -> None:
         self._session = session
         self._mobile = mobile.strip()
         self._password = password
-        self._token: str | None = None
+        self._logged_in = False
 
     @property
     def mobile_number(self) -> str:
         return self._mobile
 
-    async def _call(self, method: str, body: dict[str, Any]) -> dict[str, Any]:
-        ts = int(time.time())
-        payload = {
-            **body,
-            "Method": method,
-            "Platform": "android",
-            "App_version": "5.2.86",
-            "TimeStamp": ts,
-            "Signature": f"{random.randint(0, 100)}{ts}",
+    async def async_login(self) -> None:
+        """Establish an authenticated cookie session."""
+        # 1. GET the login page → scrape the anti-forgery token.
+        url = f"{PORTAL_BASE}{LOGIN_PATH}"
+        params = {"returnUrl": "/en/account"}
+        try:
+            async with self._session.get(
+                url, params=params, headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                login_html = await resp.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise AlfaApiError(f"Login page fetch failed: {err}") from err
+
+        token = _scrape_token(login_html)
+        if not token:
+            raise AlfaApiError("Could not find __RequestVerificationToken on login page")
+
+        # 2. POST credentials.
+        form = {
+            "__RequestVerificationToken": token,
+            "Username": self._mobile,
+            "Password": self._password,
+            "RememberMe": "false",
         }
-        encrypted = _encrypt(json.dumps(payload, separators=(",", ":")))
-        envelope = {"Data": encrypted}
         try:
             async with self._session.post(
-                API_URL,
-                json=envelope,
-                headers=_HEADERS,
+                url, params=params, data=form, headers=_HEADERS,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                post_body = await resp.text()
+                post_status = resp.status
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise AlfaApiError(f"Login POST failed: {err}") from err
+
+        # 3. Verify by probing a JSON endpoint.
+        probe = await self._raw_get(CONSUMPTION_PATH)
+        if probe.get("_json") is not None:
+            self._logged_in = True
+            return
+
+        body = probe.get("_text", "") or post_body
+        low = body.lower()
+        if any(mark in low for mark in _OTP_MARKERS):
+            raise AlfaOtpRequired(
+                "Portal login requires an OTP code — open www.alfa.com.lb in a "
+                "browser to complete sign-in, then reload the integration."
+            )
+        raise AlfaAuthError(
+            f"Login not accepted (status {post_status}); credentials or portal changed"
+        )
+
+    async def _raw_get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """GET a path; return {'_json': <obj>|None, '_text': <str>, '_status': int}.
+
+        JSON is parsed when the body is valid JSON; otherwise ``_json`` is None
+        (usually means an HTML login/OTP redirect = expired session).
+        """
+        q = {"_": str(int(time.time() * 1000))}
+        if params:
+            q.update(params)
+        url = f"{PORTAL_BASE}{path}"
+        try:
+            async with self._session.get(
+                url, params=q, headers=_HEADERS,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 text = await resp.text()
-                if resp.status >= 500:
-                    raise AlfaApiError(f"HTTP {resp.status} from Alfa: {text[:200]}")
-                if resp.status >= 400:
-                    raise AlfaApiError(f"HTTP {resp.status}: {text[:200]}")
-                try:
-                    outer = json.loads(text)
-                except ValueError as err:
-                    raise AlfaApiError(f"Bad JSON envelope: {err}") from err
-                if isinstance(outer, dict) and outer.get("Error"):
-                    raise AlfaApiError(f"Alfa API error: {outer['Error']}")
-                data_blob = outer.get("Data") if isinstance(outer, dict) else None
-                if not data_blob:
-                    raise AlfaApiError(f"No Data field in response: {text[:200]}")
-                try:
-                    decrypted = _decrypt(data_blob)
-                except Exception as err:  # noqa: BLE001
-                    raise AlfaApiError(f"Decrypt failed: {err}") from err
-                try:
-                    result = json.loads(decrypted)
-                except ValueError as err:
-                    raise AlfaApiError(f"Bad inner JSON: {err}") from err
-                _LOGGER.debug("Alfa %s -> Status=%s", method, result.get("Status"))
-                return result
-        except aiohttp.ClientError as err:
-            raise AlfaApiError(str(err)) from err
-        except asyncio.TimeoutError as err:
-            raise AlfaApiError(f"Timeout calling {method}") from err
+                status = resp.status
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise AlfaApiError(f"GET {path} failed: {err}") from err
 
-    async def _signin(self) -> None:
-        result = await self._call(
-            "Signin",
-            {
-                "Username": self._mobile,
-                "UserPassword": self._password,
-                "PlayerId": "",
-            },
-        )
-        status = result.get("Status")
-        token = result.get("accesstoken")
-        if status in _STATUS_AUTH_FAILED or not token:
-            msg = result.get("Message") or f"Status {status}"
-            raise AlfaAuthError(f"Signin rejected: {msg}")
-        if status not in _STATUS_OK:
-            raise AlfaApiError(f"Unexpected Signin Status={status}")
-        self._token = token
+        obj: Any = None
+        stripped = text.lstrip()
+        if stripped[:1] in ("{", "[") or stripped[:1].isdigit():
+            import json
+            try:
+                obj = json.loads(text)
+            except ValueError:
+                obj = None
+        return {"_json": obj, "_text": text, "_status": status}
 
-    async def _authed_call(self, method: str, body: dict[str, Any]) -> dict[str, Any]:
-        if not self._token:
-            await self._signin()
-        full = {**body, "AccessToken": self._token}
-        result = await self._call(method, full)
-        status = result.get("Status")
-        if status in _STATUS_AUTH_FAILED:
-            # Token expired — re-Signin once and retry.
-            self._token = None
-            await self._signin()
-            full = {**body, "AccessToken": self._token}
-            result = await self._call(method, full)
-        return result
+    async def _get_json(self, path: str) -> Any:
+        """GET expecting JSON, with one silent re-login on session expiry."""
+        res = await self._raw_get(path)
+        if res["_json"] is not None:
+            return res["_json"]
+        # Session likely expired → re-login once and retry.
+        _LOGGER.debug("Alfa %s returned non-JSON; re-logging in", path)
+        self._logged_in = False
+        await self.async_login()
+        res = await self._raw_get(path)
+        if res["_json"] is None:
+            raise AlfaApiError(f"{path} did not return JSON after re-login")
+        return res["_json"]
 
     async def async_validate(self) -> dict[str, Any]:
-        """Verify credentials by signing in. Returns the Profile block."""
-        await self._signin()
-        # GetAccountDetails confirms the line is provisioned.
-        details = await self._authed_call(
-            "GetAccountDetails", {"MSISDN": self._mobile}
-        )
+        """Verify credentials; return identity block for the config entry."""
+        await self.async_login()
+        consumption = await self._get_json(CONSUMPTION_PATH)
+        parsed = parsers.parse_consumption(consumption)
         return {
-            "MobileNumberValue": details.get("MobileNumberValue") or self._mobile,
-            "TypeValue": details.get("TypeValue"),
-            "SubTypeValue": details.get("SubTypeValue"),
+            "MobileNumberValue": parsed.get("mobile") or self._mobile,
+            "TypeValue": parsed.get("type"),
+            "SubTypeValue": parsed.get("subtype"),
         }
 
     async def async_get_account_data(self) -> dict[str, Any]:
-        """Fetch account, expiry, and recharge history; normalise."""
-        if not self._token:
-            await self._signin()
-        details, expiry, recharge = await asyncio.gather(
-            self._authed_call("GetAccountDetails", {"MSISDN": self._mobile}),
-            self._authed_call("GetPrepaidExpiryDate", {"MSISDN": self._mobile}),
-            self._authed_call("GetRechargeHistory", {"MSISDN": self._mobile}),
-            return_exceptions=False,
-        )
+        """Fetch consumption (mandatory) + services/expiry/recharge/rate
+        (best-effort) and merge into the coordinator model."""
+        if not self._logged_in:
+            await self.async_login()
 
-        result: dict[str, Any] = {
-            "mobile": details.get("MobileNumberValue") or self._mobile,
-            "balance_usd": _parse_money(details.get("CurrentBalanceValue")),
-            "balance_raw": details.get("CurrentBalanceValue"),
-            "response_code": details.get("Status"),
-            "services": [],
-            "last_recharge_amount": None,
-            "last_recharge_date": None,
-            "recharge_history": [],
-            "days_until_expiry": None,
-            "data_used_mb": None,
-            "data_total_mb": None,
-            "data_remaining_mb": None,
-            "plan_name": None,
-            "validity": None,
+        consumption = await self._get_json(CONSUMPTION_PATH)
+        result = parsers.parse_consumption(consumption)
+
+        # Best-effort extras: a failure of any one must not fail the poll.
+        services = await self._safe_get_json(SERVICES_PATH)
+        expiry = await self._safe_get_json(EXPIRY_PATH)
+        recharge = await self._safe_get_json(LAST_RECHARGE_PATH)
+        rate = await self._safe_get_json(EXCHANGE_RATE_PATH)
+
+        svc = parsers.parse_services(services) if services is not None else {
+            "active_bundle": None, "catalog": [], "simultaneous_activation": False,
         }
+        active = svc.get("active_bundle")
 
-        primary_used: float | None = None
-        primary_total: float | None = None
-        primary_validity: date | None = None
-        primary_plan: str | None = None
+        result["catalog"] = svc.get("catalog", [])
+        result["simultaneous_activation"] = svc.get("simultaneous_activation", False)
+        result["active_bundle_name"] = active.get("text") if active else None
+        result["active_bundle_price"] = active.get("price_usd") if active else None
 
-        for svc in details.get("ServiceInformationValue") or []:
-            name = svc.get("ServiceNameValue")
-            for det in svc.get("ServiceDetailsInformationValue") or []:
-                used = _to_mb(det.get("ConsumptionValue"), det.get("ConsumptionUnitValue"))
-                total = _to_mb(det.get("PackageValue"), det.get("PackageUnitValue"))
-                validity = _parse_dmy(det.get("ValidityDateValue"))
-                entry = {
-                    "service": name,
-                    "description": det.get("DescriptionValue"),
-                    "used_mb": used,
-                    "total_mb": total,
-                    "remaining_mb": (
-                        total - used if used is not None and total is not None else None
-                    ),
-                    "validity": validity.isoformat() if validity else None,
-                }
-                result["services"].append(entry)
-                if primary_used is None and used is not None and total is not None:
-                    primary_used = used
-                    primary_total = total
-                    primary_validity = validity
-                    primary_plan = name or det.get("DescriptionValue")
+        # plan_name + validity: pick the active bundle's matching consumption
+        # entry when we can, else the newest-expiry data bundle.
+        result["plan_name"] = _active_display_name(result["bundles"], active)
+        result["validity"] = _active_validity(result["bundles"], active)
 
-        result["data_used_mb"] = primary_used
-        result["data_total_mb"] = primary_total
-        result["data_remaining_mb"] = (
-            (primary_total - primary_used)
-            if primary_used is not None and primary_total is not None
-            else None
-        )
-        result["plan_name"] = primary_plan
-        result["validity"] = (
-            datetime.combine(primary_validity, datetime.min.time()).astimezone()
-            if primary_validity
-            else None
-        )
+        result["days_until_expiry"] = _coerce_int(expiry)
 
-        # Recharge history — newest first.
-        history: list[dict[str, Any]] = []
-        for item in recharge.get("MSISDNRecharges") or []:
-            d = _parse_dmy(item.get("TimeStamp"))
-            history.append({
-                "date": d.isoformat() if d else None,
-                "amount": _parse_money(item.get("Amount")),
-                "balance_before": _parse_money(item.get("BalanceB")),
-                "balance_after": _parse_money(item.get("BalanceA")),
-                "account": item.get("AccountNumber"),
-            })
-        result["recharge_history"] = history
-        if history:
-            result["last_recharge_amount"] = history[0]["amount"]
-            if history[0]["date"]:
-                result["last_recharge_date"] = datetime.combine(
-                    date.fromisoformat(history[0]["date"]), datetime.min.time()
-                ).astimezone()
+        if isinstance(recharge, dict):
+            result["last_recharge_amount"] = parsers.parse_money(recharge.get("Amount"))
+            result["last_recharge_date"] = _parse_recharge_date(recharge.get("Date"))
+        else:
+            result["last_recharge_amount"] = None
+            result["last_recharge_date"] = None
 
-        # Days until expiry — derive from PrepaidExpiryDate (DD/MM/YYYY).
-        exp_date = _parse_dmy(expiry.get("PrepaidExpiryDate"))
-        if exp_date:
-            result["days_until_expiry"] = (exp_date - date.today()).days
-
+        result["exchange_rate_lbp"] = _coerce_int(rate)
         return result
+
+    async def _safe_get_json(self, path: str) -> Any:
+        try:
+            return await self._get_json(path)
+        except AlfaApiError as err:
+            _LOGGER.warning("Alfa best-effort GET %s failed: %s", path, err)
+            return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _active_display_name(bundles: list[dict[str, Any]], active: dict[str, Any] | None) -> str | None:
+    """DisplayName of the consumption bundle matching the active service bundle
+    (by GB size), else the DisplayName of the newest-expiry data bundle."""
+    if active and active.get("gb") is not None:
+        for b in bundles:
+            if b.get("total_gb") == float(active["gb"]):
+                return b.get("name")
+    data_bundles = [b for b in bundles if b.get("usage_type") == "data" and b.get("expiry")]
+    if data_bundles:
+        return max(data_bundles, key=lambda b: b["expiry"]).get("name")
+    return bundles[0].get("name") if bundles else None
+
+
+def _active_validity(bundles: list[dict[str, Any]], active: dict[str, Any] | None):
+    """ISO expiry string → aware datetime for the active/newest data bundle."""
+    iso: str | None = None
+    if active and active.get("gb") is not None:
+        for b in bundles:
+            if b.get("total_gb") == float(active["gb"]):
+                iso = b.get("expiry")
+                break
+    if iso is None:
+        data_bundles = [b for b in bundles if b.get("usage_type") == "data" and b.get("expiry")]
+        if data_bundles:
+            iso = max(data_bundles, key=lambda b: b["expiry"])["expiry"]
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+
+
+def _parse_recharge_date(raw: Any):
+    """``getlastrecharge`` Date → aware datetime, or None when empty."""
+    if not raw:
+        return None
+    dt = parsers.parse_portal_dt(raw)
+    if dt:
+        return dt
+    # Some portals return DD/MM/YYYY here — tolerate it.
+    parts = str(raw).strip().split("/")
+    if len(parts) == 3:
+        try:
+            d, m, y = (int(x) for x in parts)
+            return datetime.combine(date(y, m, d), datetime.min.time()).astimezone()
+        except ValueError:
+            return None
+    return None
