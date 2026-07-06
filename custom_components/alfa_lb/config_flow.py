@@ -1,4 +1,4 @@
-"""Config flow for Alfa Lebanon."""
+"""Config flow for Alfa Lebanon (web-portal transport)."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -7,9 +7,9 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .api import AlfaApiError, AlfaAuthError, AlfaClient
+from .api import AlfaApiError, AlfaAuthError, AlfaOtpRequired, AlfaPortalClient
 from .const import CONF_MOBILE, CONF_PASSWORD, DOMAIN
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
@@ -35,10 +35,13 @@ class AlfaConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             mobile = user_input[CONF_MOBILE].strip()
             password = user_input[CONF_PASSWORD]
-            session = async_get_clientsession(self.hass)
-            client = AlfaClient(session, mobile, password)
+            # Dedicated cookie-jar session for the probe.
+            session = async_create_clientsession(self.hass)
+            client = AlfaPortalClient(session, mobile, password)
             try:
                 data = await client.async_validate()
+            except AlfaOtpRequired:
+                errors["base"] = "otp_required"
             except AlfaAuthError:
                 errors["base"] = "invalid_auth"
             except AlfaApiError:
@@ -74,10 +77,12 @@ class AlfaConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             password = user_input[CONF_PASSWORD]
-            session = async_get_clientsession(self.hass)
-            client = AlfaClient(session, mobile, password)
+            session = async_create_clientsession(self.hass)
+            client = AlfaPortalClient(session, mobile, password)
             try:
                 await client.async_validate()
+            except AlfaOtpRequired:
+                errors["base"] = "otp_required"
             except AlfaAuthError:
                 errors["base"] = "invalid_auth"
             except AlfaApiError:

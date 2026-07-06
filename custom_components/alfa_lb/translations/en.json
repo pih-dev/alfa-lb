@@ -19,6 +19,7 @@
     "error": {
       "invalid_auth": "Cookie was rejected by Alfa. Make sure you copied the full Cookie header from a logged-in session.",
       "cannot_connect": "Cannot reach Alfa servers",
+      "otp_required": "Alfa requires a one-time code. Sign in at www.alfa.com.lb in a browser, then retry.",
       "unknown": "Unexpected error"
     },
     "abort": {
