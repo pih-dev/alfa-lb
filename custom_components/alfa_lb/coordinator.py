@@ -1,4 +1,4 @@
-"""DataUpdateCoordinator for Alfa Lebanon."""
+"""DataUpdateCoordinator for Alfa Lebanon (web-portal transport)."""
 from __future__ import annotations
 
 import logging
@@ -9,17 +9,17 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import AlfaApiError, AlfaAuthError, AlfaClient
+from .api import AlfaApiError, AlfaAuthError, AlfaPortalClient
 from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class AlfaCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinator that polls the Alfa portal."""
+    """Polls the Alfa web portal every 30 minutes."""
 
     def __init__(
-        self, hass: HomeAssistant, entry: ConfigEntry, client: AlfaClient
+        self, hass: HomeAssistant, entry: ConfigEntry, client: AlfaPortalClient
     ) -> None:
         super().__init__(
             hass,
@@ -34,6 +34,7 @@ class AlfaCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             return await self.client.async_get_account_data()
         except AlfaAuthError as err:
+            # Covers AlfaOtpRequired too → HA raises a reauth flow.
             raise ConfigEntryAuthFailed(str(err)) from err
         except AlfaApiError as err:
             raise UpdateFailed(f"Error fetching Alfa data: {err}") from err
