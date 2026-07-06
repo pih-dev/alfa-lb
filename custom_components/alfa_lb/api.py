@@ -52,6 +52,13 @@ _HEADERS = {
     "Accept": "application/json, text/html, */*",
 }
 
+# The portal's JSON endpoints are AJAX-only: without the XMLHttpRequest marker
+# the ASP.NET MVC router returns a 404 HTML page even for an authenticated
+# session (verified live 2026-07-06 — same request 404s without this header,
+# 200s with it). Applied only to the read GETs, NOT the login page GET/POST
+# (adding it there can make the server return partial/AJAX content).
+_AJAX_HEADERS = {**_HEADERS, "X-Requested-With": "XMLHttpRequest"}
+
 
 class AlfaAuthError(Exception):
     """Credentials rejected / session cannot be established."""
@@ -158,7 +165,7 @@ class AlfaPortalClient:
         url = f"{PORTAL_BASE}{path}"
         try:
             async with self._session.get(
-                url, params=q, headers=_HEADERS,
+                url, params=q, headers=_AJAX_HEADERS,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 text = await resp.text()
