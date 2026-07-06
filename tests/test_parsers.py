@@ -37,3 +37,34 @@ def test_parse_portal_dt_bad_input():
     assert parsers.parse_portal_dt("") is None
     assert parsers.parse_portal_dt(None) is None
     assert parsers.parse_portal_dt("nope") is None
+
+
+def test_parse_consumption_two_bundles():
+    data = parsers.parse_consumption(load_json("getconsumptionasync.json"))
+    assert data["balance_usd"] == 19.41
+    assert data["mobile"] == "81265133"
+    assert data["type"] == "Prepaid"
+    assert len(data["bundles"]) == 2
+
+    b300 = data["bundles"][0]
+    assert b300["name"] == "Alfanet 300GB"
+    assert b300["total_gb"] == 300.0
+    assert b300["used_gb"] == 300.0
+    assert b300["remaining_gb"] == 0.0
+    # ExpiryTime 20260727235959
+    assert b300["expiry"].startswith("2026-07-27")
+
+    b400 = data["bundles"][1]
+    assert b400["remaining_gb"] == 398.5
+
+    # aggregates (decimal MB)
+    assert data["data_total_mb"] == 700000
+    assert data["data_used_mb"] == 301500
+    assert data["data_remaining_mb"] == 398500
+
+
+def test_parse_consumption_empty_payload():
+    data = parsers.parse_consumption({})
+    assert data["bundles"] == []
+    assert data["data_remaining_mb"] is None
+    assert data["balance_usd"] is None
