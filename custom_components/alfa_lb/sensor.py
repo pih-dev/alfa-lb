@@ -74,6 +74,10 @@ SENSORS: tuple[AlfaSensorEntityDescription, ...] = (
         translation_key="plan",
         icon="mdi:sim",
         value_fn=lambda d: d.get("plan_name"),
+        attrs_fn=lambda d: {
+            "active_bundle": d.get("active_bundle_name"),
+            "active_bundle_price_usd": d.get("active_bundle_price"),
+        },
     ),
     AlfaSensorEntityDescription(
         key="validity",
@@ -105,6 +109,25 @@ SENSORS: tuple[AlfaSensorEntityDescription, ...] = (
         icon="mdi:calendar-check",
         device_class=SensorDeviceClass.TIMESTAMP,
         value_fn=lambda d: d.get("last_recharge_date"),
+    ),
+    # --- new for the multi-bundle portal model ---
+    AlfaSensorEntityDescription(
+        key="bundles",
+        translation_key="bundles",
+        icon="mdi:package-variant",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda d: len(
+            [b for b in (d.get("bundles") or []) if b.get("usage_type") == "data"]
+        ),
+        attrs_fn=lambda d: {"bundles": d.get("bundles") or []},
+    ),
+    AlfaSensorEntityDescription(
+        key="exchange_rate",
+        translation_key="exchange_rate",
+        icon="mdi:currency-usd",
+        native_unit_of_measurement="LBP",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda d: d.get("exchange_rate_lbp"),
     ),
 )
 
