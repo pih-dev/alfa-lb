@@ -9,6 +9,7 @@ of the dead mobile V2/V3 transport. See
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -168,7 +169,6 @@ class AlfaPortalClient:
         obj: Any = None
         stripped = text.lstrip()
         if stripped[:1] in ("{", "[") or stripped[:1].isdigit():
-            import json
             try:
                 obj = json.loads(text)
             except ValueError:
@@ -243,9 +243,14 @@ class AlfaPortalClient:
         return result
 
     async def _safe_get_json(self, path: str) -> Any:
+        # Best-effort: a non-critical field must never fail the whole poll.
+        # _get_json can internally re-login on session expiry, and that
+        # re-login may raise AlfaAuthError/AlfaOtpRequired — catch those too
+        # (the mandatory consumption fetch is the real auth gate; an OTP/auth
+        # blip on an optional field should not abort an otherwise-good poll).
         try:
             return await self._get_json(path)
-        except AlfaApiError as err:
+        except (AlfaApiError, AlfaAuthError) as err:
             _LOGGER.warning("Alfa best-effort GET %s failed: %s", path, err)
             return None
 
