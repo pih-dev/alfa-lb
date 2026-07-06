@@ -1,13 +1,13 @@
-"""The Alfa Lebanon integration."""
+"""The Alfa Lebanon integration (web-portal transport)."""
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .api import AlfaApiError, AlfaAuthError, AlfaClient
+from .api import AlfaApiError, AlfaAuthError, AlfaPortalClient
 from .const import CONF_MOBILE, CONF_PASSWORD, DOMAIN
 from .coordinator import AlfaCoordinator
 
@@ -15,8 +15,9 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    session = async_get_clientsession(hass)
-    client = AlfaClient(
+    # Dedicated session = private cookie jar (portal auth is cookie-based).
+    session = async_create_clientsession(hass)
+    client = AlfaPortalClient(
         session,
         entry.data[CONF_MOBILE],
         entry.data[CONF_PASSWORD],
