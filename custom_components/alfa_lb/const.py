@@ -26,6 +26,10 @@ EXCHANGE_RATE_PATH = "/en/shared/exchangerate"
 # The alfa-session add-on writes the raw portal JSON here; the integration
 # reads it. Both /share paths are visible to HA Core.
 SESSION_FILE = "/share/alfa_lb/latest.json"
+# WHY duplicated elsewhere: homeassistant/packages/alfa_lb_recovery.yaml (the
+# HomeLab repo, not this one) hardcodes this same path as a shell_command
+# literal ("touch /share/alfa_lb/refresh.request") because YAML can't import
+# this Python constant. If this path ever changes, update that file too.
 REFRESH_REQUEST = "/share/alfa_lb/refresh.request"
 
 # The add-on refetches every 30 min; treat the file as stale after 60 min
