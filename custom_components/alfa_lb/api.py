@@ -11,7 +11,6 @@ No aiohttp, no pycryptodome — the integration performs no network I/O.
 from __future__ import annotations
 
 import json
-import logging
 from datetime import date, datetime
 from typing import Any
 
@@ -19,8 +18,6 @@ from homeassistant.core import HomeAssistant
 
 from . import parsers
 from .const import SESSION_FILE, STALE_AFTER
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class AlfaAuthError(Exception):
@@ -107,9 +104,12 @@ class AlfaFileClient:
         raw = doc.get("fetched_at")
         try:
             fetched = datetime.fromisoformat(raw)
+            # Naive timestamps make this subtraction raise TypeError — the
+            # add-on always writes tz-aware UTC, so naive = corrupt file,
+            # and we fail safe (sensors unavailable) like any other bad doc.
+            age = datetime.now().astimezone() - fetched
         except (TypeError, ValueError) as err:
             raise AlfaApiError(f"bad fetched_at: {raw!r}") from err
-        age = datetime.now().astimezone() - fetched
         if age > STALE_AFTER:
             raise AlfaApiError(f"session file stale by {age} (>{STALE_AFTER})")
         return doc.get("data") or {}
