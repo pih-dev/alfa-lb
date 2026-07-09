@@ -21,3 +21,12 @@ SERVICES_PATH = "/en/account/manage-services/getmyservicesasync"
 EXPIRY_PATH = "/en/account/getexpirydate"
 LAST_RECHARGE_PATH = "/en/account/getlastrecharge"
 EXCHANGE_RATE_PATH = "/en/shared/exchangerate"
+
+# --- add-on session-file transport ---
+# The alfa-session add-on writes the raw portal JSON here; the integration
+# reads it. Both /share paths are visible to HA Core.
+SESSION_FILE = "/share/alfa_lb/latest.json"
+
+# The add-on refetches every 30 min; treat the file as stale after 60 min
+# (2x cadence) so a single missed run does not flap the sensors.
+STALE_AFTER = timedelta(minutes=60)
