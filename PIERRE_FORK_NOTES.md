@@ -57,11 +57,9 @@ sees the update.
 
 ## Active divergences
 
-*(none yet — fork is currently at upstream `v0.3.1`, no Pierre-specific code)*
-
 | Branch | Status | Upstream-PR-candidate? | Summary |
 |---|---|---|---|
-| — | — | — | — |
+| `pierre/portal-rebuild` | deployed (0.5.0+pierre.session) | no — Pierre-only topology | Integration is now a pure file reader: reads the `alfa-session` HA add-on's `/share/alfa_lb/latest.json` (a separate Playwright container that logs into the web portal and passes Alfa's F5/Shape anti-bot, something aiohttp/pycryptodome can't do). Integration itself does no network I/O — no aiohttp, no pycryptodome, no OTP/reauth flow (the add-on owns auth); coordinator maps stale-file/auth errors from the add-on to `UpdateFailed`. Supersedes the earlier aiohttp portal-rebuild transport in this same branch. |
 
 When a divergence is added, the row should look like:
 
