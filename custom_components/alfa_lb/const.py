@@ -26,7 +26,12 @@ EXCHANGE_RATE_PATH = "/en/shared/exchangerate"
 # The alfa-session add-on writes the raw portal JSON here; the integration
 # reads it. Both /share paths are visible to HA Core.
 SESSION_FILE = "/share/alfa_lb/latest.json"
+REFRESH_REQUEST = "/share/alfa_lb/refresh.request"
 
 # The add-on refetches every 30 min; treat the file as stale after 60 min
 # (2x cadence) so a single missed run does not flap the sensors.
 STALE_AFTER = timedelta(minutes=60)
+
+# Reading a local file is cheap, so poll more often than the add-on writes —
+# this picks up on-demand refreshes and recovers from `unavailable` quickly.
+FILE_POLL_INTERVAL = timedelta(minutes=10)

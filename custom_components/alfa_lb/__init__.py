@@ -1,33 +1,27 @@
-"""The Alfa Lebanon integration (web-portal transport)."""
+"""The Alfa Lebanon integration (add-on file transport)."""
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.exceptions import ConfigEntryNotReady
 
-from .api import AlfaApiError, AlfaAuthError, AlfaPortalClient
-from .const import CONF_MOBILE, CONF_PASSWORD, DOMAIN
+from .api import AlfaApiError, AlfaAuthError, AlfaFileClient
+from .const import CONF_MOBILE, DOMAIN, SESSION_FILE
 from .coordinator import AlfaCoordinator
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    # Dedicated session = private cookie jar (portal auth is cookie-based).
-    session = async_create_clientsession(hass)
-    client = AlfaPortalClient(
-        session,
-        entry.data[CONF_MOBILE],
-        entry.data[CONF_PASSWORD],
-    )
+    # No network session: the add-on does all portal I/O. We read its file.
+    client = AlfaFileClient(hass, SESSION_FILE, entry.data[CONF_MOBILE])
 
+    # If the add-on has not produced a fresh file yet, retry setup rather than
+    # fail hard — the entry loads once the add-on writes latest.json.
     try:
         await client.async_validate()
-    except AlfaAuthError as err:
-        raise ConfigEntryAuthFailed(str(err)) from err
-    except AlfaApiError as err:
+    except (AlfaApiError, AlfaAuthError) as err:
         raise ConfigEntryNotReady(str(err)) from err
 
     coordinator = AlfaCoordinator(hass, entry, client)

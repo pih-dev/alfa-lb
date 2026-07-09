@@ -1,25 +1,26 @@
-"""Config flow for Alfa Lebanon (web-portal transport)."""
+"""Config flow for Alfa Lebanon (add-on file transport).
+
+Validation just confirms the add-on's session file exists, is fresh, and parses.
+Credentials live in the add-on, not here — but we keep the mobile/password fields
+so existing entries (which store both) load unchanged; password is unused.
+"""
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.helpers.aiohttp_client import async_create_clientsession
 
-from .api import AlfaApiError, AlfaAuthError, AlfaOtpRequired, AlfaPortalClient
-from .const import CONF_MOBILE, CONF_PASSWORD, DOMAIN
+from .api import AlfaApiError, AlfaAuthError, AlfaFileClient
+from .const import CONF_MOBILE, CONF_PASSWORD, DOMAIN, SESSION_FILE
 
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_MOBILE): str,
-        vol.Required(CONF_PASSWORD): str,
+        vol.Optional(CONF_PASSWORD, default=""): str,
     }
 )
-
-STEP_REAUTH_DATA_SCHEMA = vol.Schema({vol.Required(CONF_PASSWORD): str})
 
 
 class AlfaConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -34,17 +35,10 @@ class AlfaConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             mobile = user_input[CONF_MOBILE].strip()
-            password = user_input[CONF_PASSWORD]
-            # Dedicated cookie-jar session for the probe.
-            session = async_create_clientsession(self.hass)
-            client = AlfaPortalClient(session, mobile, password)
+            client = AlfaFileClient(self.hass, SESSION_FILE, mobile)
             try:
                 data = await client.async_validate()
-            except AlfaOtpRequired:
-                errors["base"] = "otp_required"
-            except AlfaAuthError:
-                errors["base"] = "invalid_auth"
-            except AlfaApiError:
+            except (AlfaApiError, AlfaAuthError):
                 errors["base"] = "cannot_connect"
             except Exception:  # noqa: BLE001
                 errors["base"] = "unknown"
@@ -54,47 +48,14 @@ class AlfaConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=f"Alfa {unique}",
-                    data={CONF_MOBILE: mobile, CONF_PASSWORD: password},
+                    data={
+                        CONF_MOBILE: mobile,
+                        CONF_PASSWORD: user_input.get(CONF_PASSWORD, ""),
+                    },
                 )
 
         return self.async_show_form(
             step_id="user",
             data_schema=STEP_USER_DATA_SCHEMA,
             errors=errors,
-        )
-
-    async def async_step_reauth(
-        self, entry_data: Mapping[str, Any]
-    ) -> ConfigFlowResult:
-        return await self.async_step_reauth_confirm()
-
-    async def async_step_reauth_confirm(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-        entry = self._get_reauth_entry()
-        mobile = entry.data[CONF_MOBILE]
-
-        if user_input is not None:
-            password = user_input[CONF_PASSWORD]
-            session = async_create_clientsession(self.hass)
-            client = AlfaPortalClient(session, mobile, password)
-            try:
-                await client.async_validate()
-            except AlfaOtpRequired:
-                errors["base"] = "otp_required"
-            except AlfaAuthError:
-                errors["base"] = "invalid_auth"
-            except AlfaApiError:
-                errors["base"] = "cannot_connect"
-            else:
-                return self.async_update_reload_and_abort(
-                    entry, data={**entry.data, CONF_PASSWORD: password}
-                )
-
-        return self.async_show_form(
-            step_id="reauth_confirm",
-            data_schema=STEP_REAUTH_DATA_SCHEMA,
-            errors=errors,
-            description_placeholders={"mobile": mobile},
         )
