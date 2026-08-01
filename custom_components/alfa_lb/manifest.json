@@ -8,5 +8,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/moussa11/alfa-lb/issues",
   "requirements": [],
-  "version": "0.5.0+pierre.session"
+  "version": "0.4.0+pierre.1"
 }

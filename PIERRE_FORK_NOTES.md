@@ -46,6 +46,12 @@ when upstream → 0.4.0 and we rebase:
 
 This keeps HACS update-detection honest without polluting upstream's semver.
 
+> **Corrected 2026-08-02.** `pierre/portal-rebuild` had drifted to
+> `0.5.0+pierre.session` — a version number invented ahead of upstream, which
+> made the fork look like the newer project rather than a downstream of it.
+> Renumbered to `0.4.0+pierre.1`, i.e. downstream of Moussa's current `0.4.0`.
+> **Never invent a base version upstream has not released.**
+
 ### HACS install on Pierre's HA
 
 HACS custom repository points at `https://github.com/pih-dev/alfa-lb`, branch
@@ -59,7 +65,7 @@ sees the update.
 
 | Branch | Status | Upstream-PR-candidate? | Summary |
 |---|---|---|---|
-| `pierre/portal-rebuild` | deployed (0.5.0+pierre.session) | no — Pierre-only topology | Integration is now a pure file reader: reads the `alfa-session` HA add-on's `/share/alfa_lb/latest.json` (a separate Playwright container that logs into the web portal and passes Alfa's F5/Shape anti-bot, something aiohttp/pycryptodome can't do). Integration itself does no network I/O — no aiohttp, no pycryptodome, no OTP/reauth flow (the add-on owns auth); coordinator maps stale-file/auth errors from the add-on to `UpdateFailed`. Supersedes the earlier aiohttp portal-rebuild transport in this same branch. |
+| `pierre/portal-rebuild` | deployed (0.4.0+pierre.1) | no — Pierre-only topology | Integration is now a pure file reader: reads the `alfa-session` HA add-on's `/share/alfa_lb/latest.json` (a separate Playwright container that logs into the web portal and passes Alfa's F5/Shape anti-bot, something aiohttp/pycryptodome can't do). Integration itself does no network I/O — no aiohttp, no pycryptodome, no OTP/reauth flow (the add-on owns auth); coordinator maps stale-file/auth errors from the add-on to `UpdateFailed`. Supersedes the earlier aiohttp portal-rebuild transport in this same branch. |
 
 When a divergence is added, the row should look like:
 
